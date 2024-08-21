@@ -108,7 +108,7 @@ def reset_scheduling_process():
 
 def main():
     st.set_page_config(layout="wide")
-    st.title("Oncology Department Night Shift Scheduler")
+    st.title("PickaThon v 1.0 - Night Shift Scheduler")
 
     today = datetime.today()
     year_range = list(range(today.year, today.year + 10))
