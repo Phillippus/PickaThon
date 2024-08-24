@@ -74,13 +74,12 @@ def finalize_schedule(schedule, resolved_schedule, doctors):
         else:
             final_schedule[day] = None
 
-    # Distribute remaining shifts fairly, ensuring no consecutive days and respecting excluded days
+    # Distribute remaining shifts fairly, ensuring no consecutive days
     for day in range(1, len(final_schedule) + 1):
         if final_schedule[day] is None:  # If no doctor is assigned
             available_doctors = [
                 doctor for doctor, count in doctor_shift_count.items()
                 if doctors[doctor].get('num_shifts', float('inf')) > count
-                and day not in doctors[doctor]['excluded_days']  # Respect excluded days
                 and (day == 1 or final_schedule[day - 1] != doctor)
                 and (day == len(final_schedule) or final_schedule[day + 1] != doctor)
             ]
@@ -106,7 +105,6 @@ def reset_scheduling_process():
     for key in list(st.session_state.keys()):
         if key.startswith("conflict_") or key in ["initial_schedule", "conflicts", "final_schedule"]:
             del st.session_state[key]
-
 def main():
     st.set_page_config(layout="wide")
     st.title("PickaThon v 1.0 - Night Shift Scheduler")
