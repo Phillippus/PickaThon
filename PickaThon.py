@@ -110,6 +110,9 @@ def reset_scheduling_process():
 def main():
     st.set_page_config(layout="wide")
     st.title("PickaThon v 1.0 - Night Shift Scheduler")
+    
+    # Debugging: Check app status
+    st.write("App is starting...")
 
     today = datetime.today()
     year_range = list(range(today.year, today.year + 10))
@@ -150,11 +153,13 @@ def main():
         holidays = get_public_holidays(selected_year)
 
         if st.button("Generate Schedule"):
+            st.write("Generating initial schedule...")  # Debugging: Check status
             st.session_state["initial_schedule"] = generate_initial_schedule(st.session_state["doctors"], selected_month, selected_year)
             st.session_state["conflicts"] = identify_conflicts(st.session_state["initial_schedule"])
 
             # Automatically finalize schedule if there are no conflicts
             if not st.session_state["conflicts"]:
+                st.write("Finalizing schedule...")  # Debugging: Check status
                 st.session_state["final_schedule"] = finalize_schedule(st.session_state["initial_schedule"], {}, st.session_state["doctors"])
 
         if "conflicts" in st.session_state and st.session_state["conflicts"]:
@@ -162,6 +167,7 @@ def main():
             resolved_schedule = resolve_conflicts(st.session_state["conflicts"])
 
             if st.button("Finalize Schedule"):
+                st.write("Finalizing schedule after conflict resolution...")  # Debugging: Check status
                 st.session_state["final_schedule"] = finalize_schedule(st.session_state["initial_schedule"], resolved_schedule, st.session_state["doctors"])
 
         if "final_schedule" in st.session_state:
