@@ -65,17 +65,7 @@ def finalize_schedule(schedule, resolved_schedule, doctors, holidays, selected_y
             day not in doctors[doctor]["excluded_days"]
             and (day == 1 or final_schedule.get(day - 1) != doctor)  # Prevent consecutive shifts
             and (day == num_days or final_schedule.get(day + 1) != doctor)  # Prevent consecutive shifts
-            and (
-                not is_weekend_day or
-                (not doctors[doctor]["no_weekend_shifts"] and
-                 (doctors[doctor]["max_weekend_shifts"] == 0 or
-                  doctor_shift_count[doctor]["weekend"] < doctors[doctor]["max_weekend_shifts"]))
-            )  # Respect weekend rules
-            and (
-                is_weekend_day or
-                (doctors[doctor]["max_weekday_shifts"] == 0 or
-                 doctor_shift_count[doctor]["weekday"] < doctors[doctor]["max_weekday_shifts"])
-            )  # Respect weekday limits
+            and (not is_weekend_day or not doctors[doctor]["no_weekend_shifts"])  # Respect no weekend shifts
         )
 
     # Helper to determine if a day is a weekend
@@ -83,7 +73,15 @@ def finalize_schedule(schedule, resolved_schedule, doctors, holidays, selected_y
         day_date = datetime.strptime(f"{selected_year}-{selected_month:02d}-{day:02d}", "%Y-%m-%d")
         return day_date.weekday() >= 5
 
-    # Step 1: Assign wanted days
+    # Step 1: Resolve conflicts in wanted days
+    for day, assigned_doctors in schedule.items():
+        if day in resolved_schedule:
+            selected_doctor = resolved_schedule[day]
+            final_schedule[day] = selected_doctor
+            shift_type = "weekend" if is_weekend(day) else "weekday"
+            doctor_shift_count[selected_doctor][shift_type] += 1
+
+    # Step 2: Assign wanted days and enforce Friday-Sunday pairing
     for doctor, details in doctors.items():
         for wanted_day in details["wanted_days"]:
             if wanted_day in final_schedule:
@@ -93,47 +91,50 @@ def finalize_schedule(schedule, resolved_schedule, doctors, holidays, selected_y
                 shift_type = "weekend" if is_weekend(wanted_day) else "weekday"
                 doctor_shift_count[doctor][shift_type] += 1
 
-    # Step 2: Enforce Friday-Sunday priority
+                # Friday-Sunday pairing
+                day_date = datetime.strptime(f"{selected_year}-{selected_month:02d}-{wanted_day:02d}", "%Y-%m-%d")
+                if day_date.weekday() == 4:  # Friday
+                    sunday = wanted_day + 2
+                    if sunday <= num_days and is_valid_doctor(sunday, doctor):
+                        final_schedule[sunday] = doctor
+                        doctor_shift_count[doctor]["weekend"] += 1
+
+    # Step 3: Assign remaining shifts while enforcing all rules
     for day in range(1, num_days + 1):
-        day_date = datetime.strptime(f"{selected_year}-{selected_month:02d}-{day:02d}", "%Y-%m-%d")
-        if day_date.weekday() == 4:  # Friday
-            sunday = day + 2
-            saturday = day + 1
-
-            if sunday <= num_days:
-                available_doctors = [
-                    doctor for doctor in doctors
-                    if is_valid_doctor(day, doctor) and is_valid_doctor(sunday, doctor)
-                ]
-
-                if available_doctors:
-                    selected_doctor = random.choice(available_doctors)
-                    final_schedule[day] = selected_doctor  # Assign Friday
-                    final_schedule[sunday] = selected_doctor  # Assign Sunday
-                    doctor_shift_count[selected_doctor]["weekend"] += 2
-                else:
-                    # Leave Friday-Sunday unassigned if no valid doctor
-                    final_schedule[day] = None
-                    final_schedule[saturday] = None
-                    final_schedule[sunday] = None
-
-    # Step 3: Assign remaining days
-    for day in range(1, num_days + 1):
-        if day not in final_schedule or final_schedule[day] is None:
+        if day not in final_schedule:
             shift_type = "weekend" if is_weekend(day) else "weekday"
+
             available_doctors = [
                 doctor for doctor in doctors
                 if is_valid_doctor(day, doctor)
+                and (
+                    doctors[doctor][f"max_{shift_type}_shifts"] == 0  # No limit
+                    or doctor_shift_count[doctor][shift_type] < doctors[doctor][f"max_{shift_type}_shifts"]
+                )
             ]
 
             if available_doctors:
                 selected_doctor = random.choice(available_doctors)
                 final_schedule[day] = selected_doctor
                 doctor_shift_count[selected_doctor][shift_type] += 1
-            else:
-                final_schedule[day] = None  # Leave day unassigned if no valid doctor
 
-    # Step 4: Revalidate to fix consecutive shifts
+    # Step 4: Validate Friday-Sunday pairing after assignments
+    for day in range(1, num_days + 1):
+        day_date = datetime.strptime(f"{selected_year}-{selected_month:02d}-{day:02d}", "%Y-%m-%d")
+        if day_date.weekday() == 4:  # Friday
+            sunday = day + 2
+            saturday = day + 1
+            if sunday <= num_days and final_schedule.get(day):
+                friday_doctor = final_schedule[day]
+                if (
+                    final_schedule.get(sunday) != friday_doctor
+                    and is_valid_doctor(sunday, friday_doctor)
+                    and final_schedule.get(saturday) != friday_doctor  # Avoid conflict with Saturday
+                ):
+                    final_schedule[sunday] = friday_doctor
+                    doctor_shift_count[friday_doctor]["weekend"] += 1
+
+    # Step 5: Revalidate to fix consecutive shifts
     for day in range(2, num_days + 1):
         if final_schedule.get(day) == final_schedule.get(day - 1):  # Consecutive shift detected
             available_doctors = [
@@ -146,8 +147,6 @@ def finalize_schedule(schedule, resolved_schedule, doctors, holidays, selected_y
                 final_schedule[day] = selected_doctor
                 shift_type = "weekend" if is_weekend(day) else "weekday"
                 doctor_shift_count[selected_doctor][shift_type] += 1
-            else:
-                final_schedule[day] = None  # Leave day unassigned if no valid doctor
 
     return final_schedule
 
