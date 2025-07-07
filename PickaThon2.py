@@ -113,9 +113,9 @@ def finalize_schedule(schedule, resolved_schedule, doctors, holidays, selected_y
                     doctor_shift_count[selected_doctor]["weekend"] += 2
                 else:
                     # Leave Friday-Sunday unassigned if no valid doctor
-                    final_schedule[day] = None
-                    final_schedule[saturday] = None
-                    final_schedule[sunday] = None
+                    final_schedule[day] = "None"
+                    final_schedule[saturday] = "None"
+                    final_schedule[sunday] = "None"
 
     # Step 3: Assign remaining days
     for day in range(1, num_days + 1):
@@ -131,7 +131,7 @@ def finalize_schedule(schedule, resolved_schedule, doctors, holidays, selected_y
                 final_schedule[day] = selected_doctor
                 doctor_shift_count[selected_doctor][shift_type] += 1
             else:
-                final_schedule[day] = None  # Leave day unassigned if no valid doctor
+                final_schedule[day] = "None"  # Leave day unassigned if no valid doctor
 
     # Step 4: Revalidate to fix consecutive shifts
     for day in range(2, num_days + 1):
@@ -147,7 +147,7 @@ def finalize_schedule(schedule, resolved_schedule, doctors, holidays, selected_y
                 shift_type = "weekend" if is_weekend(day) else "weekday"
                 doctor_shift_count[selected_doctor][shift_type] += 1
             else:
-                final_schedule[day] = None  # Leave day unassigned if no valid doctor
+                final_schedule[day] = "None"  # Leave day unassigned if no valid doctor
 
     return final_schedule
 
