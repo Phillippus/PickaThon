@@ -1,301 +1,359 @@
 import streamlit as st
 import pandas as pd
 import random
+import json
+import os
+import requests
 from datetime import datetime
 
-# List of public holidays in Slovakia
-public_holidays = {
-    1: ["01-01", "01-06"],
-    4: ["04-01"],  # Example Easter Monday, update with actual dates for each year
-    5: ["05-01", "05-08"],
-    7: ["07-05"],
-    8: ["08-29"],
-    9: ["09-01", "09-15"],
-    11: ["11-01", "11-17"],
-    12: ["12-24", "12-25", "12-26"]
-}
+# ── Persistent storage ──────────────────────────────────────────────────────
+DOCTORS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "doctors.json")
 
+def load_doctors():
+    if os.path.exists(DOCTORS_FILE):
+        with open(DOCTORS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_doctors(doctors_defaults):
+    with open(DOCTORS_FILE, "w", encoding="utf-8") as f:
+        json.dump(doctors_defaults, f, indent=2, ensure_ascii=False)
+
+# ── Public holidays (Slovak API) ─────────────────────────────────────────────
+@st.cache_data(ttl=86400)
 def get_public_holidays(year):
-    holidays = []
-    for month, days in public_holidays.items():
-        for day in days:
-            holidays.append(f"{year}-{month:02d}-{day}")
-    return holidays
-
-def validate_days(days, num_days):
-    return [day for day in days if day <= num_days]
-
-def generate_initial_schedule(doctors, month, year):
-    num_days = (pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(0)).day
-    schedule = {day: [] for day in range(1, num_days + 1)}
-
-    for doctor, details in doctors.items():
-        validated_wanted_days = validate_days(details['wanted_days'], num_days)
-        for day in validated_wanted_days:
-            if day not in details['excluded_days']:
-                schedule[day].append(doctor)
-
-    return schedule
-
-def identify_conflicts(schedule):
-    return {day: doctors for day, doctors in schedule.items() if len(doctors) > 1}
-
-
-
-def is_weekend_or_holiday(date_str, holidays):
-    date_obj = datetime.strptime(date_str, "%Y-%m-%d")
-    is_weekend = date_obj.weekday() >= 5
-    is_holiday = date_str in holidays
-    return is_weekend or is_holiday
-
-def reset_scheduling_process():
-    for key in list(st.session_state.keys()):
-        if key.startswith("conflict_") or key in ["initial_schedule", "conflicts", "final_schedule"]:
-            del st.session_state[key]
-
-def finalize_schedule(schedule, resolved_schedule, doctors, holidays, selected_year, selected_month):
-    final_schedule = {}
-    doctor_shift_count = {doctor: {"weekday": 0, "weekend": 0} for doctor in doctors.keys()}
-    num_days = len(schedule)
-
-    # Helper to check if a doctor is valid for a specific day
-    def is_valid_doctor(day, doctor):
-        is_weekend_day = is_weekend(day)
-        return (
-            day not in doctors[doctor]["excluded_days"]
-            and (day == 1 or final_schedule.get(day - 1) != doctor)  # Prevent consecutive shifts
-            and (day == num_days or final_schedule.get(day + 1) != doctor)  # Prevent consecutive shifts
-            and (
-                not is_weekend_day or
-                (not doctors[doctor]["no_weekend_shifts"] and
-                 (doctors[doctor]["max_weekend_shifts"] == 0 or
-                  doctor_shift_count[doctor]["weekend"] < doctors[doctor]["max_weekend_shifts"]))
-            )  # Respect weekend rules
-            and (
-                is_weekend_day or
-                (doctors[doctor]["max_weekday_shifts"] == 0 or
-                 doctor_shift_count[doctor]["weekday"] < doctors[doctor]["max_weekday_shifts"])
-            )  # Respect weekday limits
+    """Načíta slovenské štátne sviatky z nager.date API. Fallback na pevný zoznam."""
+    try:
+        response = requests.get(
+            f"https://date.nager.at/api/v3/PublicHolidays/{year}/SK",
+            timeout=5
         )
+        if response.status_code == 200:
+            return set(h["date"] for h in response.json())
+    except Exception:
+        pass
+    # Fallback – fixné sviatky (bez Veľkej noci)
+    fixed = ["01-01", "01-06", "05-01", "05-08", "07-05",
+             "08-29", "09-01", "09-15", "11-01", "11-17",
+             "12-24", "12-25", "12-26"]
+    return set(f"{year}-{d}" for d in fixed)
 
-    # Helper to determine if a day is a weekend
-    def is_weekend(day):
-        day_date = datetime.strptime(f"{selected_year}-{selected_month:02d}-{day:02d}", "%Y-%m-%d")
-        return day_date.weekday() >= 5
+# ── Calendar helpers ──────────────────────────────────────────────────────────
+def get_num_days(year, month):
+    return (pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(0)).day
 
-    # Step 1: Assign wanted days
-    for doctor, details in doctors.items():
-        for wanted_day in details["wanted_days"]:
-            if wanted_day in final_schedule:
-                continue  # Skip if already assigned
-            if is_valid_doctor(wanted_day, doctor):
-                final_schedule[wanted_day] = doctor
-                shift_type = "weekend" if is_weekend(wanted_day) else "weekday"
-                doctor_shift_count[doctor][shift_type] += 1
+def is_off_day(day, year, month, holidays):
+    date_str = f"{year}-{month:02d}-{day:02d}"
+    date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+    return date_obj.weekday() >= 5 or date_str in holidays
 
-    # Step 2: Enforce Friday-Sunday priority
-    for day in range(1, num_days + 1):
-        day_date = datetime.strptime(f"{selected_year}-{selected_month:02d}-{day:02d}", "%Y-%m-%d")
-        if day_date.weekday() == 4:  # Friday
-            sunday = day + 2
-            saturday = day + 1
+DAY_NAMES = ["Po", "Ut", "St", "Šv", "Pi", "So", "Ne"]
 
-            if sunday <= num_days:
-                available_doctors = [
-                    doctor for doctor in doctors
-                    if is_valid_doctor(day, doctor) and is_valid_doctor(sunday, doctor)
-                ]
+# ── Scheduling algorithm ──────────────────────────────────────────────────────
+def generate_schedule(doctors_monthly, year, month, holidays):
+    """
+    doctors_monthly: {name: {excluded_days, wanted_days,
+                              max_weekday_shifts, max_weekend_shifts, no_weekend_shifts}}
+    Returns: (schedule {day: doctor|"—"}, shift_count {doctor: {weekday, weekend}})
+    """
+    num_days = get_num_days(year, month)
+    final_schedule = {}
+    shift_count = {d: {"weekday": 0, "weekend": 0} for d in doctors_monthly}
 
-                if available_doctors:
-                    selected_doctor = random.choice(available_doctors)
-                    final_schedule[day] = selected_doctor  # Assign Friday
-                    final_schedule[sunday] = selected_doctor  # Assign Sunday
-                    doctor_shift_count[selected_doctor]["weekend"] += 2
-                else:
-                    # Leave Friday-Sunday unassigned if no valid doctor
-                    final_schedule[day] = "None"
-                    final_schedule[saturday] = "None"
-                    final_schedule[sunday] = "None"
+    def off(day):
+        return is_off_day(day, year, month, holidays)
 
-    # Step 3: Assign remaining days
-    for day in range(1, num_days + 1):
-        if day not in final_schedule or final_schedule[day] is None:
-            shift_type = "weekend" if is_weekend(day) else "weekday"
-            available_doctors = [
-                doctor for doctor in doctors
-                if is_valid_doctor(day, doctor)
-            ]
+    def can_assign(day, doctor):
+        info = doctors_monthly[doctor]
+        if day < 1 or day > num_days:
+            return False
+        if day in info["excluded_days"]:
+            return False
+        # No consecutive shifts (both directions, using already-assigned days)
+        if final_schedule.get(day - 1) == doctor:
+            return False
+        if final_schedule.get(day + 1) == doctor:
+            return False
+        if off(day):
+            if info["no_weekend_shifts"]:
+                return False
+            mx = info["max_weekend_shifts"]
+            if mx > 0 and shift_count[doctor]["weekend"] >= mx:
+                return False
+        else:
+            mx = info["max_weekday_shifts"]
+            if mx > 0 and shift_count[doctor]["weekday"] >= mx:
+                return False
+        return True
 
-            if available_doctors:
-                selected_doctor = random.choice(available_doctors)
-                final_schedule[day] = selected_doctor
-                doctor_shift_count[selected_doctor][shift_type] += 1
+    def assign(day, doctor):
+        final_schedule[day] = doctor
+        if off(day):
+            shift_count[doctor]["weekend"] += 1
+        else:
+            shift_count[doctor]["weekday"] += 1
+
+    def unassign(day):
+        doctor = final_schedule.pop(day, None)
+        if doctor and doctor != "—":
+            if off(day):
+                shift_count[doctor]["weekend"] = max(0, shift_count[doctor]["weekend"] - 1)
             else:
-                final_schedule[day] = "None"  # Leave day unassigned if no valid doctor
+                shift_count[doctor]["weekday"] = max(0, shift_count[doctor]["weekday"] - 1)
 
-    # Step 4: Revalidate to fix consecutive shifts
-    for day in range(2, num_days + 1):
-        if final_schedule.get(day) == final_schedule.get(day - 1):  # Consecutive shift detected
-            available_doctors = [
-                doctor for doctor in doctors
-                if doctor != final_schedule.get(day - 1)
-                and is_valid_doctor(day, doctor)
-            ]
-            if available_doctors:
-                selected_doctor = random.choice(available_doctors)
-                final_schedule[day] = selected_doctor
-                shift_type = "weekend" if is_weekend(day) else "weekday"
-                doctor_shift_count[selected_doctor][shift_type] += 1
+    # Step 1: Wanted days (priority; conflicts resolved randomly)
+    wanted_map = {}
+    for doctor, info in doctors_monthly.items():
+        for day in info["wanted_days"]:
+            if 1 <= day <= num_days:
+                wanted_map.setdefault(day, []).append(doctor)
+
+    for day in sorted(wanted_map):
+        if day in final_schedule:
+            continue
+        candidates = [d for d in wanted_map[day] if can_assign(day, d)]
+        if candidates:
+            assign(day, random.choice(candidates))
+
+    # Step 2: Friday + Sunday same doctor (skip if already assigned)
+    for day in range(1, num_days + 1):
+        date_obj = datetime.strptime(f"{year}-{month:02d}-{day:02d}", "%Y-%m-%d")
+        if date_obj.weekday() != 4:  # only Fridays
+            continue
+        sunday = day + 2
+        if sunday > num_days:
+            continue
+        fri_assigned = day in final_schedule
+        sun_assigned = sunday in final_schedule
+
+        if fri_assigned and sun_assigned:
+            continue  # both already set, leave them
+
+        if not fri_assigned and not sun_assigned:
+            # Find doctor who can do both
+            candidates = [d for d in doctors_monthly
+                          if can_assign(day, d) and can_assign(sunday, d)]
+            if candidates:
+                chosen = random.choice(candidates)
+                assign(day, chosen)
+                assign(sunday, chosen)
+        elif not fri_assigned:
+            candidates = [d for d in doctors_monthly if can_assign(day, d)]
+            if candidates:
+                assign(day, random.choice(candidates))
+        else:  # Sunday not assigned — try same as Friday
+            fri_doc = final_schedule[day]
+            if can_assign(sunday, fri_doc):
+                assign(sunday, fri_doc)
             else:
-                final_schedule[day] = "None"  # Leave day unassigned if no valid doctor
+                candidates = [d for d in doctors_monthly if can_assign(sunday, d)]
+                if candidates:
+                    assign(sunday, random.choice(candidates))
 
-    return final_schedule
+    # Step 3: Fill remaining days (balanced — prefer least-loaded)
+    for day in range(1, num_days + 1):
+        if day in final_schedule:
+            continue
+        candidates = [d for d in doctors_monthly if can_assign(day, d)]
+        if not candidates:
+            final_schedule[day] = "—"
+            continue
+        key = "weekend" if off(day) else "weekday"
+        candidates.sort(key=lambda d: shift_count[d][key])
+        # Pick randomly among the least-loaded third
+        top = max(1, len(candidates) // 3)
+        assign(day, random.choice(candidates[:top]))
 
+    # Step 4: Fix any remaining consecutive shifts (forward pass)
+    for day in range(1, num_days):
+        if final_schedule.get(day) == final_schedule.get(day + 1) == "—":
+            continue
+        if final_schedule.get(day) == final_schedule.get(day + 1):
+            unassign(day + 1)
+            candidates = [d for d in doctors_monthly if can_assign(day + 1, d)]
+            if candidates:
+                key = "weekend" if off(day + 1) else "weekday"
+                candidates.sort(key=lambda d: shift_count[d][key])
+                assign(day + 1, random.choice(candidates[:max(1, len(candidates) // 3)]))
+            else:
+                final_schedule[day + 1] = "—"
+
+    return final_schedule, shift_count
+
+
+# ── UI ────────────────────────────────────────────────────────────────────────
 def main():
-    st.set_page_config(layout="wide")
-    st.title("PickaThon v 2.2 - Night Shift Scheduler")
+    st.set_page_config(layout="wide", page_title="PickaThon v3.0")
+    st.title("PickaThon v 3.0 — Rozpisovač nočných služieb")
 
-    today = datetime.today()
-    year_range = list(range(today.year, today.year + 10))
+    if "doctors_defaults" not in st.session_state:
+        st.session_state["doctors_defaults"] = load_doctors()
 
-    selected_year = st.selectbox("Year", year_range, index=year_range.index(st.session_state.get("selected_year", today.year)), on_change=reset_scheduling_process)
-    selected_month = st.selectbox("Month", list(range(1, 13)), index=(st.session_state.get("selected_month", today.month) - 1), on_change=reset_scheduling_process)
+    tab1, tab2 = st.tabs(["👨‍⚕️ Správa lekárov", "📅 Generovanie rozvrhu"])
 
-    st.session_state["selected_year"] = selected_year
-    st.session_state["selected_month"] = selected_month
+    # ── TAB 1: Doctor management ──────────────────────────────────────────────
+    with tab1:
+        st.header("Lekári (uložení natrvalo)")
+        dd = st.session_state["doctors_defaults"]
 
-    if "doctors" not in st.session_state:
-        st.session_state["doctors"] = {}
-
-    with st.form("doctor_input_form", clear_on_submit=True):
-        name = st.text_input("Doctor's Name:")
-        excluded_days = st.multiselect("Excluded Days:", list(range(1, 32)))
-        wanted_days = st.multiselect("Wanted Days:", list(range(1, 32)))
-        max_weekday_shifts = st.number_input("Maximum Weekday Shifts (0 = No Limit):", min_value=0, step=1)
-        max_weekend_shifts = st.number_input("Maximum Weekend/Holiday Shifts (0 = No Limit):", min_value=0, step=1)
-        no_weekend_shifts = st.checkbox("No Weekend Shifts", value=False)
-        add_doctor = st.form_submit_button("Add Doctor")
-
-        if add_doctor and name:
-            if set(wanted_days).intersection(set(excluded_days)):
-                st.error(f"Doctor {name} cannot have the same days in both 'Wanted Days' and 'Excluded Days'.")
-            else:
-                st.session_state["doctors"][name] = {
-                    "excluded_days": excluded_days,
-                    "wanted_days": wanted_days,
-                    "max_weekday_shifts": max_weekday_shifts,
-                    "max_weekend_shifts": 0 if no_weekend_shifts else max_weekend_shifts,
-                    "no_weekend_shifts": no_weekend_shifts,
-                }
-                st.success(f"Doctor {name} added.")
-
-    if st.session_state["doctors"]:
-        st.write("### Doctors' Availability and Edit Options")
-
-        for doctor, info in st.session_state["doctors"].items():
-            col1, col2 = st.columns([3, 1])
+        with st.form("add_doctor_form", clear_on_submit=True):
+            st.subheader("Pridať / upraviť lekára")
+            col1, col2, col3 = st.columns(3)
             with col1:
-                st.write(f"**{doctor}** | Excluded Days: {info['excluded_days']} | Wanted Days: {info['wanted_days']} | "
-                         f"Max Weekday Shifts: {'No Limit' if info['max_weekday_shifts'] == 0 else info['max_weekday_shifts']} | "
-                         f"Max Weekend Shifts: {'No Weekend Shifts' if info['no_weekend_shifts'] else ('No Limit' if info['max_weekend_shifts'] == 0 else info['max_weekend_shifts'])}")
+                name = st.text_input("Meno lekára")
+                no_weekend = st.checkbox("Bez víkendových služieb")
             with col2:
-                if st.button(f"Edit {doctor}"):
-                    st.session_state["editing_doctor"] = doctor  # Track the doctor being edited
+                default_weekday = st.number_input(
+                    "Def. max nočných — pracovný deň", min_value=0, step=1, value=5,
+                    help="0 = bez limitu")
+                default_weekend = st.number_input(
+                    "Def. max nočných — víkend/sviatok", min_value=0, step=1, value=2,
+                    help="0 = bez limitu")
+            with col3:
+                st.markdown("&nbsp;")
+                st.markdown("**0 = bez limitu**")
 
-        # If editing a doctor, show the edit form
-        if "editing_doctor" in st.session_state:
-            doctor = st.session_state["editing_doctor"]
-            info = st.session_state["doctors"][doctor]
-
-            st.write(f"### Edit Details for {doctor}")
-            edited_excluded_days = st.multiselect(
-                "Excluded Days:",
-                list(range(1, 32)),
-                default=info["excluded_days"],
-            )
-            edited_wanted_days = st.multiselect(
-                "Wanted Days:",
-                list(range(1, 32)),
-                default=info["wanted_days"],
-            )
-            edited_max_weekday_shifts = st.number_input(
-                "Maximum Weekday Shifts (0 = No Limit):",
-                min_value=0,
-                value=info["max_weekday_shifts"],
-            )
-            edited_max_weekend_shifts = st.number_input(
-                "Maximum Weekend/Holiday Shifts (0 = No Limit):",
-                min_value=0,
-                value=info["max_weekend_shifts"],
-            )
-            edited_no_weekend_shifts = st.checkbox(
-                "No Weekend Shifts",
-                value=info["no_weekend_shifts"],
-            )
-
-            if st.button(f"Save Changes for {doctor}"):
-                if set(edited_wanted_days).intersection(set(edited_excluded_days)):
-                    st.error(f"Doctor {doctor} cannot have the same days in both 'Wanted Days' and 'Excluded Days'.")
-                else:
-                    # Update the doctor’s details
-                    st.session_state["doctors"][doctor] = {
-                        "excluded_days": edited_excluded_days,
-                        "wanted_days": edited_wanted_days,
-                        "max_weekday_shifts": edited_max_weekday_shifts,
-                        "max_weekend_shifts": 0 if edited_no_weekend_shifts else edited_max_weekend_shifts,
-                        "no_weekend_shifts": edited_no_weekend_shifts,
+            if st.form_submit_button("💾 Uložiť lekára"):
+                if name:
+                    dd[name] = {
+                        "max_weekday_shifts": int(default_weekday),
+                        "max_weekend_shifts": 0 if no_weekend else int(default_weekend),
+                        "no_weekend_shifts": no_weekend,
                     }
-                    st.success(f"Doctor {doctor}'s details updated.")
-                    del st.session_state["editing_doctor"]  # Clear editing state
+                    save_doctors(dd)
+                    st.success(f"Lekár **{name}** uložený.")
+                else:
+                    st.error("Zadajte meno lekára.")
 
-    if selected_year and selected_month:
+        if dd:
+            st.subheader("Zoznam lekárov")
+            for doctor in list(dd.keys()):
+                info = dd[doctor]
+                col1, col2 = st.columns([6, 1])
+                with col1:
+                    wd = f"max {info['max_weekday_shifts']} pracovných" if info["max_weekday_shifts"] > 0 else "pracovné bez limitu"
+                    if info["no_weekend_shifts"]:
+                        we = "❌ bez víkendov"
+                    elif info["max_weekend_shifts"] > 0:
+                        we = f"max {info['max_weekend_shifts']} víkend/sviatok"
+                    else:
+                        we = "víkend bez limitu"
+                    st.write(f"**{doctor}** — {wd} | {we}")
+                with col2:
+                    if st.button("🗑️ Odstrániť", key=f"del_{doctor}"):
+                        del dd[doctor]
+                        save_doctors(dd)
+                        st.rerun()
+        else:
+            st.info("Zatiaľ žiadni lekári. Pridajte ich vyššie.")
+
+    # ── TAB 2: Schedule generation ────────────────────────────────────────────
+    with tab2:
+        st.header("Generovanie mesačného rozvrhu")
+        dd = st.session_state["doctors_defaults"]
+
+        if not dd:
+            st.warning("Najprv pridajte lekárov v záložke **Správa lekárov**.")
+            return
+
+        today = datetime.today()
+        col1, col2 = st.columns(2)
+        with col1:
+            selected_year = st.selectbox("Rok", list(range(today.year, today.year + 5)))
+        with col2:
+            selected_month = st.selectbox("Mesiac", list(range(1, 13)), index=today.month - 1)
+
         holidays = get_public_holidays(selected_year)
+        num_days = get_num_days(selected_year, selected_month)
 
-        if st.button("Generate Schedule"):
-            st.session_state["initial_schedule"] = generate_initial_schedule(st.session_state["doctors"], selected_month, selected_year)
-            st.session_state["conflicts"] = identify_conflicts(st.session_state["initial_schedule"])
+        # Holiday source info
+        api_ok = True
+        try:
+            r = requests.get(f"https://date.nager.at/api/v3/PublicHolidays/{selected_year}/SK", timeout=3)
+            api_ok = r.status_code == 200
+        except Exception:
+            api_ok = False
+        if api_ok:
+            st.caption(f"✅ Štátne sviatky načítané z internetu ({len(holidays)} sviatkov v {selected_year})")
+        else:
+            st.caption("⚠️ Sviatky z internetu nedostupné — použitý pevný zoznam (bez pohyblivej Veľkej noci)")
 
-            if not st.session_state["conflicts"]:
-                st.session_state["final_schedule"] = finalize_schedule(
-                    st.session_state["initial_schedule"],
-                    {},
-                    st.session_state["doctors"],
-                    holidays,
-                    selected_year,
-                    selected_month
-                )
+        st.subheader("Mesačné nastavenia lekárov")
+        st.caption("Defaulty sú z profilu. Upravte pre tento mesiac ak treba.")
 
-        if "conflicts" in st.session_state and st.session_state["conflicts"]:
-            resolved_schedule = {}
-            for day, doctors in st.session_state["conflicts"].items():
-                resolved_schedule[day] = st.selectbox(f"Resolve conflict for day {day}:", doctors, key=f"conflict_{day}")
+        monthly_settings = {}
+        for doctor, defaults in dd.items():
+            with st.expander(f"⚙️ {doctor}"):
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    max_wd = st.number_input("Max pracovných nočných", min_value=0, step=1,
+                                             value=defaults["max_weekday_shifts"], key=f"wd_{doctor}")
+                    max_we = st.number_input("Max víkend/sviatok nočných", min_value=0, step=1,
+                                             value=defaults["max_weekend_shifts"], key=f"we_{doctor}")
+                    no_we = st.checkbox("Bez víkendových", value=defaults["no_weekend_shifts"], key=f"nowe_{doctor}")
+                with c2:
+                    excl = st.multiselect("Vylúčené dni", list(range(1, num_days + 1)), key=f"excl_{doctor}")
+                with c3:
+                    want = st.multiselect("Požadované dni", list(range(1, num_days + 1)), key=f"want_{doctor}")
 
-            if st.button("Finalize Schedule"):
-                st.session_state["final_schedule"] = finalize_schedule(
-                    st.session_state["initial_schedule"],
-                    resolved_schedule,
-                    st.session_state["doctors"],
-                    holidays,
-                    selected_year,
-                    selected_month
-                )
+                monthly_settings[doctor] = {
+                    "max_weekday_shifts": int(max_wd),
+                    "max_weekend_shifts": 0 if no_we else int(max_we),
+                    "no_weekend_shifts": no_we,
+                    "excluded_days": excl,
+                    "wanted_days": want,
+                }
+
+        if st.button("🎲 Generovať rozvrh", type="primary"):
+            schedule, shift_count = generate_schedule(
+                monthly_settings, selected_year, selected_month, holidays)
+            st.session_state["final_schedule"] = schedule
+            st.session_state["shift_count"] = shift_count
+            st.session_state["sched_year"] = selected_year
+            st.session_state["sched_month"] = selected_month
 
         if "final_schedule" in st.session_state:
-            st.write("### Final Night Shift Schedule")
-            schedule_data = []
+            schedule = st.session_state["final_schedule"]
+            shift_count = st.session_state["shift_count"]
+            yr = st.session_state["sched_year"]
+            mo = st.session_state["sched_month"]
+            hols = get_public_holidays(yr)
+            n_days = get_num_days(yr, mo)
 
-            final_schedule = st.session_state["final_schedule"]
+            st.subheader("📋 Výsledný rozvrh")
+            rows = []
+            for day in range(1, n_days + 1):
+                date_str = f"{yr}-{mo:02d}-{day:02d}"
+                date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+                day_name = DAY_NAMES[date_obj.weekday()]
+                is_special = date_obj.weekday() >= 5 or date_str in hols
+                flag = "🔴" if is_special else ""
+                rows.append({
+                    "Deň": f"{flag} {day}. {day_name}",
+                    "Dátum": date_str,
+                    "Lekár": schedule.get(day, "—"),
+                })
+            df = pd.DataFrame(rows).set_index("Deň")
+            st.dataframe(df, use_container_width=True)
 
-            num_days = (pd.Timestamp(year=selected_year, month=selected_month, day=1) + pd.offsets.MonthEnd(0)).day
+            st.subheader("📊 Počet služieb")
+            summary = [
+                {
+                    "Lekár": doc,
+                    "Pracovné nočné": cnts["weekday"],
+                    "Víkend/sviatok": cnts["weekend"],
+                    "Celkom": cnts["weekday"] + cnts["weekend"],
+                }
+                for doc, cnts in shift_count.items()
+            ]
+            st.dataframe(pd.DataFrame(summary).set_index("Lekár"), use_container_width=True)
 
-            for day in range(1, num_days + 1):
-                date_str = f"{selected_year}-{selected_month:02d}-{day:02d}"
-                day_display = f"**{day}**" if is_weekend_or_holiday(date_str, holidays) else str(day)
-                doctor = final_schedule.get(day, "None")  # Use .get() to avoid KeyError
-                schedule_data.append({"Date": day_display, "Doctor": doctor})
+            unassigned = [d for d, doc in schedule.items() if doc == "—"]
+            if unassigned:
+                st.warning(f"⚠️ Neobsadené dni: {unassigned}")
+            else:
+                st.success("✅ Všetky dni obsadené.")
 
-            df_schedule = pd.DataFrame(schedule_data)
-            st.dataframe(df_schedule.set_index("Date"))
 
 if __name__ == "__main__":
     main()
